@@ -17,6 +17,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import threading
 from abc import ABC, abstractmethod
 from functools import lru_cache  # pylint: disable=syntax-error
 
@@ -249,6 +250,7 @@ class ExifTool:
         self._exiftoolproc = _ExifToolProc(
             exiftool=exiftool, large_file_support=large_file_support
         )
+        self._lock = threading.Lock()
         self._read_exif()
 
     @property
@@ -352,53 +354,54 @@ class ExifTool:
         if not commands:
             raise TypeError("must provide one or more command to run")
 
-        if self._context_mgr and self.overwrite:
-            commands = list(commands)
-            commands.append("-overwrite_original")
+        with self._lock:
+            if self._context_mgr and self.overwrite:
+                commands = list(commands)
+                commands.append("-overwrite_original")
 
-        filename = b"" if no_file else os.fsencode(self.file)
+            filename = b"" if no_file else os.fsencode(self.file)
 
-        if self.flags:
-            # need to split flags, e.g. so "--ext AVI" becomes ["--ext", "AVI"]
-            flags = []
-            for f in self.flags:
-                flags.extend(f.split())
-            command_str = b"\n".join([f.encode("utf-8") for f in flags])
-            command_str += b"\n"
-        else:
-            command_str = b""
-
-        command_str += (
-            b"\n".join([c.encode("utf-8") for c in commands])
-            + b"\n"
-            + filename
-            + b"\n"
-            + b"-execute\n"
-        )
-
-        # send the command
-        process = self._process
-        process.stdin.write(command_str)
-        process.stdin.flush()
-
-        # read the output
-        output = b""
-        warning = b""
-        error = b""
-        while EXIFTOOL_STAYOPEN_EOF not in str(output):
-            line = process.stdout.readline()
-            if line.startswith(b"Warning"):
-                warning += line.strip()
-            elif line.startswith(b"Error"):
-                error += line.strip()
+            if self.flags:
+                # need to split flags, e.g. so "--ext AVI" becomes ["--ext", "AVI"]
+                flags = []
+                for f in self.flags:
+                    flags.extend(f.split())
+                command_str = b"\n".join([f.encode("utf-8") for f in flags])
+                command_str += b"\n"
             else:
-                output += line.strip()
-        warning = "" if warning == b"" else warning.decode("utf-8")
-        error = "" if error == b"" else error.decode("utf-8")
-        self.warning = warning
-        self.error = error
+                command_str = b""
 
-        return output[:-EXIFTOOL_STAYOPEN_EOF_LEN], warning, error
+            command_str += (
+                b"\n".join([c.encode("utf-8") for c in commands])
+                + b"\n"
+                + filename
+                + b"\n"
+                + b"-execute\n"
+            )
+
+            # send the command
+            process = self._process
+            process.stdin.write(command_str)
+            process.stdin.flush()
+
+            # read the output
+            output = b""
+            warning = b""
+            error = b""
+            while EXIFTOOL_STAYOPEN_EOF not in str(output):
+                line = process.stdout.readline()
+                if line.startswith(b"Warning"):
+                    warning += line.strip()
+                elif line.startswith(b"Error"):
+                    error += line.strip()
+                else:
+                    output += line.strip()
+            warning = "" if warning == b"" else warning.decode("utf-8")
+            error = "" if error == b"" else error.decode("utf-8")
+            self.warning = warning
+            self.error = error
+
+            return output[:-EXIFTOOL_STAYOPEN_EOF_LEN], warning, error
 
     @property
     def version(self):
