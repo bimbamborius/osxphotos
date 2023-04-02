@@ -1,11 +1,11 @@
 """ Yet another simple exiftool wrapper 
     I rolled my own for following reasons: 
     1. I wanted something under MIT license (best alternative was licensed under GPL/BSD)
-    2. I wanted singleton behavior so only a single exiftool process was ever running
+    2. I wanted exiftool processes to stay resident between calls (improved performance)
     3. When used as a context manager, I wanted the operations to batch until exiting the context (improved performance)
-    If these aren't important to you, I highly recommend you use Sven Marnach's excellent 
-    pyexiftool: https://github.com/smarnach/pyexiftool which provides more functionality """
+"""
 
+from __future__ import annotations
 
 import atexit
 import contextlib
@@ -30,6 +30,8 @@ __all__ = [
     "unescape_str",
 ]
 
+logger = logging.getLogger("osxphotos")
+
 # exiftool -stay_open commands outputs this EOF marker after command is run
 EXIFTOOL_STAYOPEN_EOF = "{ready}"
 EXIFTOOL_STAYOPEN_EOF_LEN = len(EXIFTOOL_STAYOPEN_EOF)
@@ -41,6 +43,8 @@ EXIFTOOL_PROCESSES = []
 EXIFTOOL_FILETYPES_JSON = "exiftool_filetypes.json"
 with (pathlib.Path(__file__).parent / EXIFTOOL_FILETYPES_JSON).open("r") as f:
     EXIFTOOL_SUPPORTED_FILETYPES = json.load(f)
+
+NUM_PROCESSES = os.cpu_count() or 1
 
 
 def exiftool_can_write(suffix: str) -> bool:
@@ -96,8 +100,11 @@ def get_exiftool_path():
 
 
 class _ExifToolProc:
-    """Runs exiftool in a subprocess via Popen
-    Creates a singleton object"""
+    """
+    Runs exiftool in a subprocess via Popen
+    Creates a singleton object that dispatches commands to one or
+    more exiftool subprocesses.
+    """
 
     def __new__(cls, *args, **kwargs):
         """create new object or return instance of already created singleton"""
@@ -106,7 +113,11 @@ class _ExifToolProc:
 
         return cls.instance
 
-    def __init__(self, exiftool=None, large_file_support=True):
+    def __init__(
+        self,
+        exiftool: str | None = None,
+        large_file_support: bool = True,
+    ):
         """construct _ExifToolProc singleton object or return instance of already created object
 
         Args:
@@ -117,7 +128,7 @@ class _ExifToolProc:
         if hasattr(self, "_process_running") and self._process_running:
             # already running
             if exiftool is not None and exiftool != self._exiftool:
-                logging.warning(
+                logger.warning(
                     f"exiftool subprocess already running, "
                     f"ignoring exiftool={exiftool}"
                 )
@@ -125,6 +136,9 @@ class _ExifToolProc:
         self._process_running = False
         self._large_file_support = large_file_support
         self._exiftool = exiftool or get_exiftool_path()
+        self._num_processes = NUM_PROCESSES
+        self._process = []
+        self._process_counter = 0
         self._start_proc(large_file_support=large_file_support)
 
     @property
@@ -132,23 +146,20 @@ class _ExifToolProc:
         """return the exiftool subprocess"""
         if not self._process_running:
             self._start_proc(large_file_support=self._large_file_support)
-        return self._process
-
-    @property
-    def pid(self):
-        """return process id (PID) of the exiftool process"""
-        return self._process.pid
+        process_idx = self._process_counter % self._num_processes
+        self._process_counter += 1
+        return self._process[process_idx]
 
     @property
     def exiftool(self):
         """return path to exiftool process"""
         return self._exiftool
 
-    def _start_proc(self, large_file_support):
+    def _start_proc(self, large_file_support: bool):
         """start exiftool in batch mode"""
 
         if self._process_running:
-            logging.warning("exiftool already running: {self._process}")
+            logger.debug(f"exiftool already running: {self._process}")
             return
 
         # open exiftool process
@@ -156,25 +167,28 @@ class _ExifToolProc:
         env = os.environ.copy()
         env["PATH"] = f'/usr/bin/:{env["PATH"]}'
         large_file_args = ["-api", "largefilesupport=1"] if large_file_support else []
-        self._process = subprocess.Popen(
-            [
-                self._exiftool,
-                "-stay_open",  # keep process open in batch mode
-                "True",  # -stay_open=True, keep process open in batch mode
-                *large_file_args,
-                "-@",  # read command-line arguments from file
-                "-",  # read from stdin
-                "-common_args",  # specifies args common to all commands subsequently run
-                "-n",  # no print conversion (e.g. print tag values in machine readable format)
-                "-P",  # Preserve file modification date/time
-                "-G",  # print group name for each tag
-                "-E",  # escape tag values for HTML (allows use of HTML &#xa; for newlines)
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
+        for _ in range(self._num_processes):
+            self._process.append(
+                subprocess.Popen(
+                    [
+                        self._exiftool,
+                        "-stay_open",  # keep process open in batch mode
+                        "True",  # -stay_open=True, keep process open in batch mode
+                        *large_file_args,
+                        "-@",  # read command-line arguments from file
+                        "-",  # read from stdin
+                        "-common_args",  # specifies args common to all commands subsequently run
+                        "-n",  # no print conversion (e.g. print tag values in machine readable format)
+                        "-P",  # Preserve file modification date/time
+                        "-G",  # print group name for each tag
+                        "-E",  # escape tag values for HTML (allows use of HTML &#xa; for newlines)
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+            )
         self._process_running = True
 
         EXIFTOOL_PROCESSES.append(self)
@@ -185,17 +199,19 @@ class _ExifToolProc:
         if not self._process_running:
             return
 
-        with contextlib.suppress(Exception):
-            self._process.stdin.write(b"-stay_open\n")
-            self._process.stdin.write(b"False\n")
-            self._process.stdin.flush()
-        try:
-            self._process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.communicate()
+        for i in range(self._num_processes):
+            process = self._process[i]
+            with contextlib.suppress(Exception):
+                process.stdin.write(b"-stay_open\n")
+                process.stdin.write(b"False\n")
+                process.stdin.flush()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
 
-        del self._process
+        self._process = []
         self._process_running = False
 
 
@@ -361,15 +377,16 @@ class ExifTool:
         )
 
         # send the command
-        self._process.stdin.write(command_str)
-        self._process.stdin.flush()
+        process = self._process
+        process.stdin.write(command_str)
+        process.stdin.flush()
 
         # read the output
         output = b""
         warning = b""
         error = b""
         while EXIFTOOL_STAYOPEN_EOF not in str(output):
-            line = self._process.stdout.readline()
+            line = process.stdout.readline()
             if line.startswith(b"Warning"):
                 warning += line.strip()
             elif line.startswith(b"Error"):
@@ -382,11 +399,6 @@ class ExifTool:
         self.error = error
 
         return output[:-EXIFTOOL_STAYOPEN_EOF_LEN], warning, error
-
-    @property
-    def pid(self):
-        """return process id (PID) of the exiftool process"""
-        return self._process.pid
 
     @property
     def version(self):
@@ -404,7 +416,7 @@ class ExifTool:
         """
         json_str, _, _ = self.run_commands("-json")
         if not json_str:
-            return dict()
+            return {}
         json_str = unescape_str(json_str.decode("utf-8"))
 
         try:
@@ -412,8 +424,8 @@ class ExifTool:
         except Exception as e:
             # will fail with some commands, e.g --ext AVI which produces
             # 'No file with specified extension' instead of json
-            logging.warning(f"error loading json returned by exiftool: {e} {json_str}")
-            return dict()
+            logger.warning(f"error loading json returned by exiftool: {e} {json_str}")
+            return {}
         exifdict = exifdict[0]
         if not tag_groups:
             # strip tag groups
@@ -482,7 +494,12 @@ class _ExifToolCaching(ExifTool):
         """
         self._json_cache = None
         self._asdict_cache = {}
-        super().__init__(filepath, exiftool=exiftool, overwrite=False, flags=None)
+        super().__init__(
+            filepath,
+            exiftool=exiftool,
+            overwrite=False,
+            flags=None,
+        )
 
     def run_commands(self, *commands, no_file=False):
         if commands[0] not in ["-json", "-ver"]:

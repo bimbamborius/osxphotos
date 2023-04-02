@@ -419,22 +419,6 @@ def test_addvalues_unicode():
     assert sorted(exif.data["IPTC:Keywords"]) == sorted(["ǂ", "Ƕ"])
 
 
-def test_singleton():
-    import osxphotos.exiftool
-
-    exif1 = osxphotos.exiftool.ExifTool(TEST_FILE_ONE_KEYWORD)
-    exif2 = osxphotos.exiftool.ExifTool(TEST_FILE_MULTI_KEYWORD)
-
-    assert exif1._process.pid == exif2._process.pid
-
-
-def test_pid():
-    import osxphotos.exiftool
-
-    exif1 = osxphotos.exiftool.ExifTool(TEST_FILE_ONE_KEYWORD)
-    assert exif1.pid == exif1._process.pid
-
-
 def test_exiftoolproc_process():
     import osxphotos.exiftool
 
