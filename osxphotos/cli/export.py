@@ -1,5 +1,7 @@
 """export command for osxphotos CLI"""
 
+from __future__ import annotations
+
 import atexit
 import inspect
 import os
@@ -9,7 +11,8 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Any, Callable
+import concurrent.futures
 
 import click
 from osxmetadata import (
@@ -1426,173 +1429,156 @@ def export(
 
         photo_num = 0
         num_exported = 0
+        # hack to avoid passing all the options to export_photo
+        kwargs = locals().copy()
+        kwargs["export_dir"] = dest
+        kwargs["export_preview"] = preview
         limit_str = f" (limit = [num]{limit}[/num])" if limit else ""
         with rich_progress(console=get_verbose_console(), mock=no_progress) as progress:
             task = progress.add_task(
                 f"Exporting [num]{num_photos}[/] photos{limit_str}", total=num_photos
             )
-            for p in photos:
-                photo_num += 1
-                # hack to avoid passing all the options to export_photo
-                kwargs = {
-                    k: v
-                    for k, v in locals().items()
-                    if k in inspect.getfullargspec(export_photo).args
-                }
-                kwargs["photo"] = p
-                kwargs["export_dir"] = dest
-                kwargs["export_preview"] = preview
-                export_results = export_photo(**kwargs)
-                if post_function:
-                    for function in post_function:
-                        # post function is tuple of (function, filename.py::function_name)
-                        verbose(f"Calling post-function [bold]{function[1]}")
-                        if not dry_run:
-                            try:
-                                function[0](p, export_results, verbose)
-                            except Exception as e:
-                                rich_echo_error(
-                                    f"[error]Error running post-function [italic]{function[1]}[/italic]: {e}"
+            futures = []
+            with concurrent.futures.ThreadPoolExecutor(
+                # max_workers=os.cpu_count()
+                max_workers=1,
+            ) as executor:
+                for p in photos:
+                    photo_num += 1
+                    kwargs["photo_num"] = photo_num
+                    futures.append(executor.submit(export_worker, p, **kwargs))
+
+                for future in concurrent.futures.as_completed(futures):
+                    p, export_results = future.result()
+                    if album_export and export_results.exported:
+                        try:
+                            album_export.add(p)
+                            export_results.exported_album = [
+                                (filename, album_export.name)
+                                for filename in export_results.exported
+                            ]
+                        except Exception as e:
+                            click.secho(
+                                f"Error adding photo {p.original_filename} ({p.uuid}) to album {album_export.name}: {e}",
+                                fg=CLI_COLOR_ERROR,
+                                err=True,
+                            )
+
+                    if album_skipped and export_results.skipped:
+                        try:
+                            album_skipped.add(p)
+                            export_results.skipped_album = [
+                                (filename, album_skipped.name)
+                                for filename in export_results.skipped
+                            ]
+                        except Exception as e:
+                            click.secho(
+                                f"Error adding photo {p.original_filename} ({p.uuid}) to album {album_skipped.name}: {e}",
+                                fg=CLI_COLOR_ERROR,
+                                err=True,
+                            )
+
+                    if album_missing and export_results.missing:
+                        try:
+                            album_missing.add(p)
+                            export_results.missing_album = [
+                                (filename, album_missing.name)
+                                for filename in export_results.missing
+                            ]
+                        except Exception as e:
+                            click.secho(
+                                f"Error adding photo {p.original_filename} ({p.uuid}) to album {album_missing.name}: {e}",
+                                fg=CLI_COLOR_ERROR,
+                                err=True,
+                            )
+
+                    results += export_results
+
+                    # all photo files (not including sidecars) that are part of this export set
+                    # used below for applying Finder tags, etc.
+                    photo_files = set(
+                        export_results.exported
+                        + export_results.new
+                        + export_results.updated
+                        + export_results.exif_updated
+                        + export_results.converted_to_jpeg
+                        + export_results.skipped
+                    )
+
+                    if finder_tag_keywords or finder_tag_template:
+                        if dry_run:
+                            for filepath in photo_files:
+                                verbose(
+                                    f"Writing Finder tags to [filepath]{filepath}[/]"
                                 )
-
-                run_post_command(
-                    photo=p,
-                    post_command=post_command,
-                    export_results=export_results,
-                    export_dir=dest,
-                    dry_run=dry_run,
-                    exiftool_path=exiftool_path,
-                    export_db=export_db,
-                    verbose=verbose,
-                )
-
-                if album_export and export_results.exported:
-                    try:
-                        album_export.add(p)
-                        export_results.exported_album = [
-                            (filename, album_export.name)
-                            for filename in export_results.exported
-                        ]
-                    except Exception as e:
-                        click.secho(
-                            f"Error adding photo {p.original_filename} ({p.uuid}) to album {album_export.name}: {e}",
-                            fg=CLI_COLOR_ERROR,
-                            err=True,
-                        )
-
-                if album_skipped and export_results.skipped:
-                    try:
-                        album_skipped.add(p)
-                        export_results.skipped_album = [
-                            (filename, album_skipped.name)
-                            for filename in export_results.skipped
-                        ]
-                    except Exception as e:
-                        click.secho(
-                            f"Error adding photo {p.original_filename} ({p.uuid}) to album {album_skipped.name}: {e}",
-                            fg=CLI_COLOR_ERROR,
-                            err=True,
-                        )
-
-                if album_missing and export_results.missing:
-                    try:
-                        album_missing.add(p)
-                        export_results.missing_album = [
-                            (filename, album_missing.name)
-                            for filename in export_results.missing
-                        ]
-                    except Exception as e:
-                        click.secho(
-                            f"Error adding photo {p.original_filename} ({p.uuid}) to album {album_missing.name}: {e}",
-                            fg=CLI_COLOR_ERROR,
-                            err=True,
-                        )
-
-                results += export_results
-
-                # all photo files (not including sidecars) that are part of this export set
-                # used below for applying Finder tags, etc.
-                photo_files = set(
-                    export_results.exported
-                    + export_results.new
-                    + export_results.updated
-                    + export_results.exif_updated
-                    + export_results.converted_to_jpeg
-                    + export_results.skipped
-                )
-
-                if finder_tag_keywords or finder_tag_template:
-                    if dry_run:
-                        for filepath in photo_files:
-                            verbose(f"Writing Finder tags to [filepath]{filepath}[/]")
-                    else:
-                        tags_written, tags_skipped = write_finder_tags(
-                            p,
-                            photo_files,
-                            keywords=finder_tag_keywords,
-                            keyword_template=keyword_template,
-                            album_keyword=album_keyword,
-                            person_keyword=person_keyword,
-                            exiftool_merge_keywords=exiftool_merge_keywords,
-                            finder_tag_template=finder_tag_template,
-                            strip=strip,
-                            export_dir=dest,
-                            verbose=verbose,
-                        )
-                        export_results.xattr_written.extend(tags_written)
-                        export_results.xattr_skipped.extend(tags_skipped)
-                        results.xattr_written.extend(tags_written)
-                        results.xattr_skipped.extend(tags_skipped)
-
-                if xattr_template:
-                    if dry_run:
-                        for filepath in photo_files:
-                            verbose(
-                                f"Writing extended attributes to [filepath]{filepath}[/]"
+                        else:
+                            tags_written, tags_skipped = write_finder_tags(
+                                p,
+                                photo_files,
+                                keywords=finder_tag_keywords,
+                                keyword_template=keyword_template,
+                                album_keyword=album_keyword,
+                                person_keyword=person_keyword,
+                                exiftool_merge_keywords=exiftool_merge_keywords,
+                                finder_tag_template=finder_tag_template,
+                                strip=strip,
+                                export_dir=dest,
+                                verbose=verbose,
                             )
-                    else:
-                        xattr_written, xattr_skipped = write_extended_attributes(
-                            p,
-                            photo_files,
-                            xattr_template,
-                            strip=strip,
-                            export_dir=dest,
-                            verbose=verbose,
-                        )
-                        export_results.xattr_written.extend(xattr_written)
-                        export_results.xattr_skipped.extend(xattr_skipped)
-                        results.xattr_written.extend(xattr_written)
-                        results.xattr_skipped.extend(xattr_skipped)
+                            export_results.xattr_written.extend(tags_written)
+                            export_results.xattr_skipped.extend(tags_skipped)
+                            results.xattr_written.extend(tags_written)
+                            results.xattr_skipped.extend(tags_skipped)
 
-                report_writer.write(export_results)
-
-                if print_template:
-                    options = RenderOptions(export_dir=dest)
-                    for template in print_template:
-                        rendered_templates, unmatched = p.render_template(
-                            template,
-                            options,
-                        )
-                        if unmatched:
-                            rich_click_echo(
-                                f"[warning]Unmatched template field: {unmatched}[/]"
+                    if xattr_template:
+                        if dry_run:
+                            for filepath in photo_files:
+                                verbose(
+                                    f"Writing extended attributes to [filepath]{filepath}[/]"
+                                )
+                        else:
+                            xattr_written, xattr_skipped = write_extended_attributes(
+                                p,
+                                photo_files,
+                                xattr_template,
+                                strip=strip,
+                                export_dir=dest,
+                                verbose=verbose,
                             )
-                        for rendered_template in rendered_templates:
-                            if not rendered_template:
-                                continue
-                            rich_click_echo(rendered_template)
+                            export_results.xattr_written.extend(xattr_written)
+                            export_results.xattr_skipped.extend(xattr_skipped)
+                            results.xattr_written.extend(xattr_written)
+                            results.xattr_skipped.extend(xattr_skipped)
 
-                progress.advance(task)
+                    report_writer.write(export_results)
 
-                # handle limit
-                if export_results.exported:
-                    # if any photos were exported, increment num_exported used by limit
-                    # limit considers each PhotoInfo object as a single photo even if multiple files are exported
-                    num_exported += 1
-                if limit and num_exported >= limit:
-                    # advance progress to end
-                    progress.advance(task, num_photos - photo_num)
-                    break
+                    if print_template:
+                        options = RenderOptions(export_dir=dest)
+                        for template in print_template:
+                            rendered_templates, unmatched = p.render_template(
+                                template,
+                                options,
+                            )
+                            if unmatched:
+                                rich_click_echo(
+                                    f"[warning]Unmatched template field: {unmatched}[/]"
+                                )
+                            for rendered_template in rendered_templates:
+                                if not rendered_template:
+                                    continue
+                                rich_click_echo(rendered_template)
+
+                    progress.advance(task)
+
+                    # handle limit
+                    if export_results.exported:
+                        # if any photos were exported, increment num_exported used by limit
+                        # limit considers each PhotoInfo object as a single photo even if multiple files are exported
+                        num_exported += 1
+                    if limit and num_exported >= limit:
+                        # advance progress to end
+                        progress.advance(task, num_photos - photo_num)
+                        break
 
         photo_str_total = pluralize(len(photos), "photo", "photos")
         if update or force_update:
@@ -1680,6 +1666,45 @@ def export(
         verbose(f"Writing export database changes back to [filepath]{export_db.path}")
         export_db.write_to_disk()
     export_db.close()
+
+
+def export_worker(
+    photo: osxphotos.PhotoInfo, **kwargs
+) -> tuple[osxphotos.PhotoInfo, ExportResults]:
+    """Export worker function for multi-threaded export of photos"""
+    dry_run = kwargs["dry_run"]
+    verbose: Callable[[str], Any] = kwargs["verbose"]
+    export_args = {
+        k: v
+        for k, v in kwargs.items()
+        if k in inspect.getfullargspec(export_photo).args
+    }
+    export_args["photo"] = photo
+    export_results = export_photo(**export_args)
+    if post_function := kwargs["post_function"]:
+        for function in post_function:
+            # post function is tuple of (function, filename.py::function_name)
+            verbose(f"Calling post-function [bold]{function[1]}")
+            if not dry_run:
+                try:
+                    function[0](photo, export_results, verbose)
+                except Exception as e:
+                    rich_echo_error(
+                        f"[error]Error running post-function [italic]{function[1]}[/italic]: {e}"
+                    )
+
+    run_post_command(
+        photo=photo,
+        post_command=kwargs["post_command"],
+        export_results=export_results,
+        export_dir=kwargs["dest"],
+        dry_run=dry_run,
+        exiftool_path=kwargs["exiftool_path"],
+        export_db=kwargs["export_db"],
+        verbose=verbose,
+    )
+
+    return photo, export_results
 
 
 def export_photo(
