@@ -76,7 +76,11 @@ def _months_since(start_date: datetime, end_date: datetime) -> int:
         start_date, end_date = end_date, start_date
     years_difference = end_date.year - start_date.year
     months_difference = end_date.month - start_date.month
-    return years_difference * 12 + months_difference
+    total_months = years_difference * 12 + months_difference
+        # Adjust if end_date's day is less than start_date's day
+    if end_date.day < start_date.day:
+        total_months -= 1
+    return total_months
 
 
 def _years_since(start_date: datetime, end_date: datetime) -> int:
